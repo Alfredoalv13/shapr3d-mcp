@@ -425,8 +425,9 @@ def open_in_shapr3d(path: str) -> str:
         raise FileNotFoundError(f"No such file: {src}")
     subprocess.run(["open", "-a", APP_NAME, str(src)], check=True, timeout=15)
     return (
-        f"Sent {src.name} to Shapr3D. The app shows an import confirmation; "
-        "the user may need to click Import and choose units (files are in mm)."
+        f"Sent {src.name} to Shapr3D. The app shows an Import Preferences "
+        "dialog (Quality/Speed/Custom); the user clicks Import. STEP files "
+        "carry their units (mm), so no unit choice is needed."
     )
 
 
