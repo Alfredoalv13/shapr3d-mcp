@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "shapr3d": {
+      "command": "uv",
+      "args": ["run", "shapr3d-mcp"]
+    }
+  }
+}

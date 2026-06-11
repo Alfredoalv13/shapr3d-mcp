@@ -1,0 +1,33 @@
+[project]
+name = "shapr3d-mcp"
+version = "0.1.0"
+description = "MCP server for CAD modeling with build123d and Shapr3D via STEP file exchange"
+readme = "README.md"
+authors = [
+    { name = "Side Quest Studios", email = "sidequeststudios25@gmail.com" }
+]
+keywords = ["mcp", "cad", "shapr3d", "build123d", "step", "opencascade"]
+classifiers = [
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: MacOS",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+requires-python = ">=3.13"
+dependencies = [
+    "build123d>=0.10.0",
+    "matplotlib>=3.10.9",
+    "mcp[cli]>=1.27.2",
+]
+
+[project.scripts]
+shapr3d-mcp = "shapr3d_mcp:main"
+
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["uv_build>=0.11.2,<0.12.0"]
+build-backend = "uv_build"
