@@ -103,3 +103,7 @@ Shapr3D app needed) in a throwaway workspace.
   on imported solids regardless.
 - In-app actions (sketching, export) happen via the user or OS-level
   computer-use automation; there is no app API to drive.
+
+## License
+
+[MIT](LICENSE)

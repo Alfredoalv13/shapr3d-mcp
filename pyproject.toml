@@ -3,6 +3,8 @@ name = "shapr3d-mcp"
 version = "0.1.0"
 description = "MCP server for CAD modeling with build123d and Shapr3D via STEP file exchange"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Side Quest Studios", email = "sidequeststudios25@gmail.com" }
 ]
