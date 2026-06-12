@@ -30,6 +30,7 @@ def test_detect_clash_clear_when_separated():
     report = server.detect_clash(["clash_apart.step"])
     assert report["clear"] is True
     assert report["clashes"] == []
+    assert report["check_errors"] == []
     assert report["pairs_checked"] == 1
 
 

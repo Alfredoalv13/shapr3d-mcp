@@ -399,6 +399,7 @@ def detect_clash(paths: list[str], min_overlap_mm3: float = 0.001) -> dict:
             "IGES files transfer as surfaces (no solids); convert to STEP."
         )
     clashes = []
+    check_errors = []
     pairs = 0
     for i in range(len(entries)):
         for j in range(i + 1, len(entries)):
@@ -410,27 +411,39 @@ def detect_clash(paths: list[str], min_overlap_mm3: float = 0.001) -> dict:
                     ba.min.Y > bb.max.Y or bb.min.Y > ba.max.Y or
                     ba.min.Z > bb.max.Z or bb.min.Z > ba.max.Z):
                 continue
+            # A failed boolean must NOT read as "no clash" - record it so the
+            # caller knows the check was incomplete.
             try:
                 overlap = a["solid"].intersect(b["solid"])
-            except Exception:
+                vol = (getattr(overlap, "volume", 0.0) or 0.0) if overlap else 0.0
+            except Exception as exc:
+                check_errors.append(
+                    {"a": a["ref"], "b": b["ref"], "error": str(exc)[:200]}
+                )
                 continue
-            vol = getattr(overlap, "volume", 0.0) or 0.0
             if vol > min_overlap_mm3:
-                obb = overlap.bounding_box()
-                clashes.append({
+                entry = {
                     "a": a["ref"],
                     "b": b["ref"],
                     "overlap_mm3": round(vol, 4),
-                    "overlap_bbox_min": [round(v, 3) for v in
-                                         (obb.min.X, obb.min.Y, obb.min.Z)],
-                    "overlap_bbox_max": [round(v, 3) for v in
-                                         (obb.max.X, obb.max.Y, obb.max.Z)],
-                })
+                }
+                try:
+                    obb = overlap.bounding_box()
+                    entry["overlap_bbox_min"] = [
+                        round(v, 3) for v in (obb.min.X, obb.min.Y, obb.min.Z)
+                    ]
+                    entry["overlap_bbox_max"] = [
+                        round(v, 3) for v in (obb.max.X, obb.max.Y, obb.max.Z)
+                    ]
+                except Exception:
+                    pass  # location is best-effort; the clash itself stands
+                clashes.append(entry)
     return {
-        "clear": not clashes,
+        "clear": not clashes and not check_errors,
         "solids": len(entries),
         "pairs_checked": pairs,
         "clashes": clashes,
+        "check_errors": check_errors,
     }
 
 
