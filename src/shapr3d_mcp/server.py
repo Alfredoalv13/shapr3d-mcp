@@ -217,6 +217,41 @@ def _export(shape, base: Path, formats: list[str]) -> list[str]:
     return written
 
 
+def _load_params(params_file: str) -> dict:
+    """Load a YAML or JSON parameter file into a plain dict."""
+    import json
+
+    src = _resolve(params_file)
+    if not src.exists():
+        raise FileNotFoundError(f"No such params file: {src}")
+    text = src.read_text()
+    if src.suffix.lower() == ".json":
+        data = json.loads(text)
+    else:
+        import yaml
+
+        data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Params file must contain a mapping at the top level, "
+            f"got {type(data).__name__}."
+        )
+    return data
+
+
+def _collect_solids(paths: list[Path]) -> list[dict]:
+    """Import files and flatten to a list of {ref, solid} entries."""
+    entries: list[dict] = []
+    for path in paths:
+        shape = _import_any(path)
+        solids = shape.solids()
+        for i, s in enumerate(solids):
+            label = getattr(s, "label", "") or None
+            ref = f"{path.name}#{i}" + (f" ({label})" if label else "")
+            entries.append({"ref": ref, "solid": s})
+    return entries
+
+
 def _osascript(script: str) -> str:
     proc = subprocess.run(
         ["osascript", "-e", script], capture_output=True, text=True, timeout=15
@@ -231,7 +266,8 @@ def _osascript(script: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def create_model(name: str, script: str, formats: list[str] | None = None) -> dict:
+def create_model(name: str, script: str, formats: list[str] | None = None,
+                 params_file: str | None = None) -> dict:
     """Create a 3D model from a build123d Python script and export it.
 
     The script runs with `from build123d import *` already in scope and MUST
@@ -251,8 +287,13 @@ def create_model(name: str, script: str, formats: list[str] | None = None) -> di
         formats: Export formats, default ["step"]. Options: step, stl, 3mf,
             gltf, glb, brep. STEP is what Shapr3D imports as editable solid
             bodies.
+        params_file: Optional YAML/JSON file whose top-level mapping is
+            exposed to the script as the variable `params`. Use this as the
+            single source of truth for shared dimensions instead of
+            hardcoding them, e.g. `wall = params["enclosure"]["wall"]`.
     """
-    shape = _run_script(script)
+    extra = {"params": _load_params(params_file)} if params_file else None
+    shape = _run_script(script, extra)
     base = WORKDIR / _safe_name(name)
     files = _export(shape, base, formats or ["step"])
     return {
@@ -264,7 +305,8 @@ def create_model(name: str, script: str, formats: list[str] | None = None) -> di
 
 @mcp.tool()
 def modify_model(input_path: str, script: str, output_name: str | None = None,
-                 formats: list[str] | None = None) -> dict:
+                 formats: list[str] | None = None,
+                 params_file: str | None = None) -> dict:
     """Modify an existing CAD file (e.g. one exported from Shapr3D as STEP).
 
     The imported geometry is available in the script as the variable
@@ -280,12 +322,17 @@ def modify_model(input_path: str, script: str, output_name: str | None = None,
         script: build123d code using `imported`, assigning `result`.
         output_name: Base name for output files. Defaults to "<input>_modified".
         formats: Export formats, default ["step"].
+        params_file: Optional YAML/JSON file exposed to the script as the
+            variable `params` (see create_model).
     """
     src = _resolve(input_path)
     if not src.exists():
         raise FileNotFoundError(f"No such file: {src}")
     imported = _import_any(src)
-    shape = _run_script(script, {"imported": imported})
+    extra: dict = {"imported": imported}
+    if params_file:
+        extra["params"] = _load_params(params_file)
+    shape = _run_script(script, extra)
     base = WORKDIR / _safe_name(output_name or src.stem + "_modified")
     files = _export(shape, base, formats or ["step"])
     return {"files": files, "stats": _shape_stats(shape)}
@@ -317,6 +364,74 @@ def inspect_model(path: str) -> dict:
     except Exception:
         pass
     return info
+
+
+@mcp.tool()
+def detect_clash(paths: list[str], min_overlap_mm3: float = 0.001) -> dict:
+    """Check solids for interference (clash) by pairwise boolean intersection.
+
+    Pass one file (all solids in it are checked against each other — e.g. an
+    assembly compound) or several files (solids are pooled across them).
+    Reference geometry like keep-out volumes can be modeled as solids and
+    clash-checked against real parts to enforce interface contracts.
+
+    Args:
+        paths: One or more STEP/IGES/STL/BREP/3MF files. Relative paths
+            resolve against the models workspace.
+        min_overlap_mm3: Overlap volume below this is ignored (numeric noise
+            from coincident faces). Default 0.001 mm^3.
+
+    Returns:
+        clear: True if no pair overlaps; clashes: list of overlapping pairs
+        with their overlap volume and bounding box, so the offending region
+        can be located.
+    """
+    resolved = []
+    for p in paths:
+        src = _resolve(p)
+        if not src.exists():
+            raise FileNotFoundError(f"No such file: {src}")
+        resolved.append(src)
+    entries = _collect_solids(resolved)
+    if len(entries) < 2:
+        raise ValueError(
+            f"Need at least 2 solids to clash-check, found {len(entries)}. "
+            "IGES files transfer as surfaces (no solids); convert to STEP."
+        )
+    clashes = []
+    pairs = 0
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            pairs += 1
+            a, b = entries[i], entries[j]
+            # Cheap reject: bounding boxes that don't intersect can't clash.
+            ba, bb = a["solid"].bounding_box(), b["solid"].bounding_box()
+            if (ba.min.X > bb.max.X or bb.min.X > ba.max.X or
+                    ba.min.Y > bb.max.Y or bb.min.Y > ba.max.Y or
+                    ba.min.Z > bb.max.Z or bb.min.Z > ba.max.Z):
+                continue
+            try:
+                overlap = a["solid"].intersect(b["solid"])
+            except Exception:
+                continue
+            vol = getattr(overlap, "volume", 0.0) or 0.0
+            if vol > min_overlap_mm3:
+                obb = overlap.bounding_box()
+                clashes.append({
+                    "a": a["ref"],
+                    "b": b["ref"],
+                    "overlap_mm3": round(vol, 4),
+                    "overlap_bbox_min": [round(v, 3) for v in
+                                         (obb.min.X, obb.min.Y, obb.min.Z)],
+                    "overlap_bbox_max": [round(v, 3) for v in
+                                         (obb.max.X, obb.max.Y, obb.max.Z)],
+                })
+    return {
+        "clear": not clashes,
+        "solids": len(entries),
+        "pairs_checked": pairs,
+        "clashes": clashes,
+    }
 
 
 @mcp.tool()
