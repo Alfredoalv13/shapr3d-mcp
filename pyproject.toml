@@ -19,6 +19,7 @@ dependencies = [
     "build123d>=0.10.0",
     "matplotlib>=3.10.9",
     "mcp[cli]>=1.27.2",
+    "pyyaml>=6.0.3",
 ]
 
 [project.scripts]

@@ -29,8 +29,9 @@ AI assistant ──MCP──▶ this server ──build123d/OCCT──▶ model.
 
 | Tool | Purpose |
 |---|---|
-| `create_model` | Build a model from a build123d script, export STEP/STL/3MF/glTF/GLB/BREP |
+| `create_model` | Build a model from a build123d script (optionally fed by a shared `params_file`), export STEP/STL/3MF/glTF/GLB/BREP |
 | `modify_model` | Import an existing file (e.g. Shapr3D STEP export), edit it in code, re-export |
+| `detect_clash` | Pairwise interference check between solids (assembly/keep-out verification) |
 | `inspect_model` | Solids, bounding box, volume, face/edge counts of a STEP/IGES/STL/BREP/3MF file |
 | `convert_model` | Read STEP / IGES / STL / BREP / 3MF, write STEP / STL / 3MF / glTF / GLB / BREP |
 | `render_preview` | Shaded isometric PNG preview without opening any app |
