@@ -7,7 +7,14 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # The CAD half is pure Python and must pass everywhere. The app half is
+    # behind platform detection, so the suite stays meaningful on runners
+    # where Shapr3D is not installed at all.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5

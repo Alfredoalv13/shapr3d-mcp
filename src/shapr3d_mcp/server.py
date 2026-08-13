@@ -22,6 +22,8 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
 
+from . import appbridge
+
 # build123d logs verbosely at INFO; anything reaching stdout would corrupt
 # the MCP stdio transport, so clamp it before the kernel is imported.
 logging.getLogger("build123d").setLevel(logging.ERROR)
@@ -252,13 +254,8 @@ def _collect_solids(paths: list[Path]) -> list[dict]:
     return entries
 
 
-def _osascript(script: str) -> str:
-    proc = subprocess.run(
-        ["osascript", "-e", script], capture_output=True, text=True, timeout=15
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip())
-    return proc.stdout.strip()
+# App control lives in appbridge.py, which has a backend per platform.
+# See that module for why Windows cannot simply swap command names.
 
 
 # ---------------------------------------------------------------------------
@@ -541,81 +538,50 @@ def list_models() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Shapr3D app bridge (macOS)
+# Shapr3D app bridge (macOS, Windows, WSL)
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
 def open_in_shapr3d(path: str) -> str:
     """Open a CAD file in Shapr3D. STEP files import as editable solid
-    bodies; Shapr3D shows an import dialog where the user confirms units."""
+    bodies; Shapr3D shows an import dialog where the user confirms units.
+
+    On Windows/WSL the file is passed as a launch argument because .step has
+    no file association; the returned message names the exact path to import
+    by hand if the app ignores it."""
     src = _resolve(path)
     if not src.exists():
         raise FileNotFoundError(f"No such file: {src}")
-    subprocess.run(["open", "-a", APP_NAME, str(src)], check=True, timeout=15)
-    return (
-        f"Sent {src.name} to Shapr3D. The app shows an Import Preferences "
-        "dialog (Quality/Speed/Custom); the user clicks Import. STEP files "
-        "carry their units (mm), so no unit choice is needed."
-    )
+    return appbridge.open_file(src)
 
 
 @mcp.tool()
 def shapr3d_status() -> dict:
     """Check whether Shapr3D is installed, running, and frontmost."""
-    installed = Path(f"/Applications/{APP_NAME}.app").exists()
-    running = subprocess.run(
-        ["pgrep", "-x", APP_NAME], capture_output=True
-    ).returncode == 0
-    frontmost = None
-    if running:
-        try:
-            front = _osascript(
-                'tell application "System Events" to get name of first '
-                "application process whose frontmost is true"
-            )
-            frontmost = front == APP_NAME
-        except Exception:
-            pass
+    installed = appbridge.is_installed()
+    running = appbridge.is_running() if installed else False
     return {
+        "platform": appbridge.PLATFORM,
         "installed": installed,
         "running": running,
-        "frontmost": frontmost,
+        "frontmost": appbridge.is_frontmost() if running else None,
         "workspace": str(WORKDIR),
-        "note": (
-            "Shapr3D has no public API. Control is via STEP file exchange. "
-            "For in-app actions (history, sketching, export), the user acts "
-            "in the app or you use OS-level automation (computer use)."
-        ),
+        "note": appbridge.status_note(),
     }
 
 
 @mcp.tool()
 def activate_shapr3d() -> str:
     """Launch Shapr3D (if needed) and bring it to the foreground."""
-    subprocess.run(["open", "-a", APP_NAME], check=True, timeout=15)
-    return "Shapr3D activated."
+    return appbridge.activate()
 
 
 @mcp.tool()
 def screenshot_shapr3d() -> Image:
     """Capture a screenshot of the Shapr3D window to see the current state
-    of the model/app. Requires Screen Recording permission for the host
-    process the first time."""
-    if subprocess.run(["pgrep", "-x", APP_NAME], capture_output=True).returncode != 0:
-        raise RuntimeError("Shapr3D is not running. Call activate_shapr3d first.")
-    try:
-        bounds = _osascript(
-            f'tell application "System Events" to tell process "{APP_NAME}" to '
-            "get {position, size} of front window"
-        )
-        x, y, w, h = [int(v.strip()) for v in bounds.split(",")]
-        region = ["-R", f"{x},{y},{w},{h}"]
-    except Exception:
-        region = []  # fall back to full screen
-    out = WORKDIR / "_shapr3d_screenshot.png"
-    subprocess.run(
-        ["screencapture", "-x", *region, str(out)], check=True, timeout=15
-    )
+    of the model/app. On macOS this needs Screen Recording permission for the
+    host process the first time."""
+    out = appbridge.screenshot(WORKDIR / "_shapr3d_screenshot.png")
     return Image(path=str(out))
 
 

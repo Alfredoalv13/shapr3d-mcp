@@ -16,8 +16,8 @@ So this server takes the only robust route:
 2. **STEP file exchange.** Generated models export as STEP, which Shapr3D
    imports as fully **editable solid bodies**. Files you export *from*
    Shapr3D (STEP/IGES/STL) can be inspected, modified, and converted.
-3. **macOS app bridge.** Tools to launch Shapr3D, open files in it, check its
-   state, and screenshot its window for visual feedback.
+3. **App bridge (macOS, Windows, WSL).** Tools to launch Shapr3D, open files in
+   it, check its state, and screenshot its window for visual feedback.
 
 ```
 AI assistant ──MCP──▶ this server ──build123d/OCCT──▶ model.step ──▶ Shapr3D
@@ -43,7 +43,40 @@ AI assistant ──MCP──▶ this server ──build123d/OCCT──▶ model.
 
 ## Setup
 
-Requires macOS, [uv](https://docs.astral.sh/uv/), and Shapr3D installed.
+Requires [uv](https://docs.astral.sh/uv/) and, for the app-bridge tools,
+Shapr3D installed.
+
+**Platform support**
+
+| Platform | Modeling / inspection / conversion | App bridge |
+|---|---|---|
+| macOS | yes | yes (`open`, AppleScript, `screencapture`) |
+| Windows | yes | yes (MSIX package, PowerShell + Win32) |
+| WSL | yes | yes, over Windows interop to the Windows Shapr3D |
+| Linux | yes | no — Shapr3D does not exist there; those tools raise `BridgeUnsupported` |
+
+The CAD half is pure Python and has no platform-specific code. Only the app
+bridge differs, and it differs more than command names:
+
+- **Windows.** Shapr3D ships as an **MSIX/Store package**, so there is no
+  launchable path — `C:\Program Files\WindowsApps` is ACL-locked and testing
+  for the install directory returns `False` for a perfectly good install. It is
+  launched by **AppUserModelID** (`shell:AppsFolder\<PackageFamilyName>!<AppId>`),
+  discovered at runtime from the package manifest rather than hardcoded.
+- **`.step` / `.stp` have no file association on Windows**, so there is no
+  equivalent of `open -a Shapr3D file.step`. The file is passed as a launch
+  argument, and `open_in_shapr3d` returns the exact path to import by hand if
+  the app ignores it.
+- **A packaged app does not own its own window.** Its top-level window belongs
+  to `ApplicationFrameHost.exe`, so `MainWindowHandle` is `0` forever and
+  `GetForegroundWindow()`'s owning process is never Shapr3D. The window is found
+  by enumerating top-level windows for an `ApplicationFrameWindow` titled
+  `Shapr3D`. Code that trusts `MainWindowHandle` does not error — it silently
+  reports "not running" and captures the wrong thing.
+- **WSL.** App calls cross the interop boundary via `powershell.exe`, and paths
+  are translated with `wslpath`. Files outside `/mnt` are staged to
+  `C:\Users\Public\shapr3d-mcp` first, because packaged apps generally cannot
+  open `\\wsl.localhost\...` UNC paths.
 
 ```sh
 uv sync
@@ -105,6 +138,14 @@ Shapr3D app needed) in a throwaway workspace.
   on imported solids regardless.
 - In-app actions (sketching, export) happen via the user or OS-level
   computer-use automation; there is no app API to drive.
+- **Windows/WSL screenshots need the window in front.** The capture reads
+  screen pixels in the window's rectangle, so anything overlapping Shapr3D
+  lands in the image instead. The window is raised first, but Windows refuses
+  `SetForegroundWindow` from a background process; when the raise fails the
+  tool logs an `OCCLUDED` warning rather than returning a wrong image
+  silently. Click Shapr3D once and retry.
+- `PrintWindow` would avoid that but is unusable here: a Direct3D-rendered
+  viewport — which is exactly what a CAD app has — commonly returns black.
 
 ## License
 
