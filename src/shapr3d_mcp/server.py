@@ -261,6 +261,41 @@ def _osascript(script: str) -> str:
     return proc.stdout.strip()
 
 
+def _shapr3d_history_mentions(needle: str) -> bool:
+    """Check Shapr3D's own accessibility tree for a History entry containing
+    `needle`. This is real verification, not a timing guess: Shapr3D exposes
+    its History panel text (e.g. 'Import "foo.step"') to the accessibility
+    API, confirmed by inspecting the tree directly after a real import. An
+    AppleScript string literal can't safely embed arbitrary text (quotes,
+    backslashes), so the needle travels via an environment variable and the
+    script reads it with `system attribute`, which takes any string as-is."""
+    script = '''
+    tell application "System Events"
+        tell process "Shapr3D"
+            set needle to system attribute "SHAPR3D_MCP_NEEDLE"
+            set allElems to entire contents of front window
+            repeat with e in allElems
+                try
+                    set v to value of e
+                    if v is not missing value then
+                        if (v as text) contains needle then
+                            return "FOUND"
+                        end if
+                    end if
+                end try
+            end repeat
+            return "NOTFOUND"
+        end tell
+    end tell
+    '''
+    env = dict(os.environ, SHAPR3D_MCP_NEEDLE=needle)
+    proc = subprocess.run(
+        ["osascript", "-e", script], capture_output=True, text=True,
+        timeout=15, env=env,
+    )
+    return proc.returncode == 0 and proc.stdout.strip() == "FOUND"
+
+
 # ---------------------------------------------------------------------------
 # modeling tools
 # ---------------------------------------------------------------------------
@@ -545,17 +580,106 @@ def list_models() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def open_in_shapr3d(path: str) -> str:
-    """Open a CAD file in Shapr3D. STEP files import as editable solid
-    bodies; Shapr3D shows an import dialog where the user confirms units."""
+def open_in_shapr3d(path: str, new_project: bool = True) -> str:
+    """Open a CAD file in Shapr3D as a real editable body.
+
+    Verified against Shapr3D 26.143.0 - two things the original approach got
+    wrong, found by testing, not assumed:
+
+    1. Plain `open -a Shapr3D file.step` does NOT reliably import geometry.
+       With no project open it silently creates an empty project titled after
+       the file (workspace stays empty - confirmed via the History panel).
+       With a project already open it instead pops Shapr3D's own "Import to:
+       Current Project / New Project" dialog, whose timing/default-button
+       behavior isn't something to drive blindly.
+    2. The only flow that imports deterministically is the in-app menu: File >
+       Import File... (Shift-Cmd-I) from a known project state, then the
+       standard macOS open panel's go-to-folder (Shift-Cmd-G) to jump straight
+       to the file. So this function always starts from an explicit New
+       Project (Cmd-N) rather than relying on `open -a` with a path argument,
+       which sidesteps the ambiguous native dialog entirely.
+
+    Requires the calling app to have Accessibility + Automation (System
+    Events) permission in System Settings > Privacy & Security - macOS will
+    prompt for this on first use if not already granted.
+
+    Args:
+        path: File to import (STEP preferred - imports as an editable body).
+        new_project: Start a fresh project before importing (default True).
+            Set False to import into whatever project is already frontmost.
+
+    Raises:
+        RuntimeError: if the History panel doesn't show this file as imported
+            after retrying. This is checked for real (via Shapr3D's own
+            accessibility tree, which exposes its History text) rather than
+            assumed from timing - a silent no-op import (the exact failure
+            mode this replaced) is a wrong answer, not a warning to skip.
+    """
     src = _resolve(path)
     if not src.exists():
         raise FileNotFoundError(f"No such file: {src}")
-    subprocess.run(["open", "-a", APP_NAME, str(src)], check=True, timeout=15)
-    return (
-        f"Sent {src.name} to Shapr3D. The app shows an Import Preferences "
-        "dialog (Quality/Speed/Custom); the user clicks Import. STEP files "
-        "carry their units (mm), so no unit choice is needed."
+
+    import time
+
+    def _attempt() -> None:
+        subprocess.run(["open", "-a", APP_NAME], check=True, timeout=15)
+        time.sleep(1.0)
+
+        path_str = str(src).replace("\\", "\\\\").replace('"', '\\"')
+        new_project_step = (
+            'keystroke "n" using {command down}\n            delay 0.8'
+            if new_project else ""
+        )
+        script = f'''
+        tell application "{APP_NAME}" to activate
+        delay 0.4
+        tell application "System Events"
+            tell process "{APP_NAME}"
+                {new_project_step}
+                keystroke "i" using {{shift down, command down}}
+                delay 0.8
+                keystroke "g" using {{shift down, command down}}
+                delay 0.4
+                keystroke "{path_str}"
+                delay 0.3
+                key code 36
+                delay 0.8
+                key code 36
+            end tell
+        end tell
+        '''
+        _osascript(script)
+
+    needle = f'Import "{src.name}"'
+    attempts = 0
+    for attempts in (1, 2):
+        _attempt()
+        # The import (or the failure mode this replaced - a silent empty
+        # project) both finish well under a second once triggered; poll
+        # briefly rather than guessing a single fixed delay.
+        confirmed = False
+        for _ in range(10):
+            if _shapr3d_history_mentions(needle):
+                confirmed = True
+                break
+            time.sleep(0.5)
+        if confirmed:
+            return (
+                f"Imported {src.name} into a "
+                f"{'new' if new_project else 'the current'} Shapr3D project "
+                f"via File > Import File... (UI-automated - Shapr3D has no "
+                f"API for this). Confirmed via the History panel"
+                f"{' after a retry' if attempts == 2 else ''} - not just "
+                "assumed from timing."
+            )
+
+    raise RuntimeError(
+        f"Could not confirm {src.name} was imported into Shapr3D after "
+        f"{attempts} attempts (checked the History panel for "
+        f"'{needle}' and didn't find it). Call screenshot_shapr3d to see "
+        "what actually happened - a dialog may be blocking input, or "
+        "Accessibility/Automation permission may need re-granting in "
+        "System Settings > Privacy & Security."
     )
 
 
