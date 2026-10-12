@@ -50,6 +50,13 @@ WORKDIR.mkdir(parents=True, exist_ok=True)
 APP_NAME = "Shapr3D"
 IMPORT_FORMATS = {".step", ".stp", ".stl", ".brep", ".iges", ".igs"}
 
+IS_WINDOWS = sys.platform == "win32"
+# On Windows, Shapr3D is a Microsoft Store (MSIX) app: no install folder to
+# probe and no command-line file arguments, only package activation.
+WIN_EXE = "Shapr3D.exe"
+WIN_PACKAGE_PREFIX = "Shapr3D.Shapr3D_"
+WIN_PACKAGE_FAMILY_DEFAULT = "Shapr3D.Shapr3D_dvv5p1vgwv6mp"
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -224,7 +231,7 @@ def _load_params(params_file: str) -> dict:
     src = _resolve(params_file)
     if not src.exists():
         raise FileNotFoundError(f"No such params file: {src}")
-    text = src.read_text()
+    text = src.read_text(encoding="utf-8")
     if src.suffix.lower() == ".json":
         data = json.loads(text)
     else:
@@ -254,11 +261,218 @@ def _collect_solids(paths: list[Path]) -> list[dict]:
 
 def _osascript(script: str) -> str:
     proc = subprocess.run(
-        ["osascript", "-e", script], capture_output=True, text=True, timeout=15
+        ["osascript", "-e", script], capture_output=True, text=True,
+        stdin=subprocess.DEVNULL, timeout=15,
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip())
     return proc.stdout.strip()
+
+
+# Windows helpers. Child processes get stdin=DEVNULL: inheriting the MCP
+# stdin pipe on Windows can hang the child while the server is reading it.
+
+def _win_package_family() -> str | None:
+    """Package family name of the installed Shapr3D Store app, or None."""
+    import winreg
+
+    key = (r"Software\Classes\Local Settings\Software\Microsoft\Windows"
+           r"\CurrentVersion\AppModel\Repository\Packages")
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+            i = 0
+            while True:
+                try:
+                    full = winreg.EnumKey(k, i)
+                except OSError:
+                    return None
+                # Full name: Name_Version_Arch__PublisherId
+                if full.startswith(WIN_PACKAGE_PREFIX) and "__" in full:
+                    return WIN_PACKAGE_PREFIX + full.rsplit("__", 1)[1]
+                i += 1
+    except OSError:
+        return None
+
+
+def _win_app_pids() -> set[int]:
+    proc = subprocess.run(
+        ["tasklist", "/FI", f"IMAGENAME eq {WIN_EXE}", "/FO", "CSV", "/NH"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15,
+    )
+    pids = set()
+    for line in proc.stdout.splitlines():
+        cols = [c.strip('"') for c in line.split('","')]
+        if len(cols) > 1 and cols[0].lower() == WIN_EXE.lower():
+            pids.add(int(cols[1]))
+    return pids
+
+
+def _win_find_window() -> int | None:
+    """Top-level window handle of Shapr3D, or None if it has no visible one.
+
+    Store apps draw into a CoreWindow owned by Shapr3D.exe, hosted inside an
+    ApplicationFrameWindow that belongs to ApplicationFrameHost.exe, so the
+    frame is matched by its children's owning process.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    pids = _win_app_pids()
+    if not pids:
+        return None
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def owned(hwnd) -> bool:
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value in pids
+
+    def hosts_app(frame) -> bool:
+        hit: list[int] = []
+
+        def on_child(hwnd, _):
+            if owned(hwnd):
+                hit.append(hwnd)
+                return False
+            return True
+
+        user32.EnumChildWindows(frame, enum_proc(on_child), 0)
+        return bool(hit)
+
+    match: list[int] = []
+
+    def on_top(hwnd, _):
+        if user32.IsWindowVisible(hwnd) and (owned(hwnd) or hosts_app(hwnd)):
+            match.append(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(enum_proc(on_top), 0)
+    return match[0] if match else None
+
+
+def _win_capture_window(hwnd: int, out: Path) -> None:
+    """Save the window's own pixels to `out`, even if other windows cover it.
+
+    PrintWindow with PW_RENDERFULLCONTENT asks DWM for the window's content
+    (needed for GPU-rendered Store apps), then the invisible resize border is
+    cropped off using the DWM frame bounds.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    from PIL import Image as PILImage  # ships with matplotlib
+
+    user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+    user32.GetWindowDC.restype = wintypes.HDC
+    gdi32.CreateCompatibleDC.restype = wintypes.HDC
+    gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    gdi32.SelectObject.restype = wintypes.HGDIOBJ
+    user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+    user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+
+    # Physical pixels; otherwise scaled displays report virtualized sizes.
+    PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+    old_ctx = user32.SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2)
+    hwnd = wintypes.HWND(hwnd)
+    window_dc = mem_dc = bitmap = None
+    try:
+        win, frame = wintypes.RECT(), wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(win))
+        DWMWA_EXTENDED_FRAME_BOUNDS = 9
+        if ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+            ctypes.byref(frame), ctypes.sizeof(frame),
+        ) != 0:
+            frame = win
+        w, h = win.right - win.left, win.bottom - win.top
+
+        window_dc = user32.GetWindowDC(hwnd)
+        mem_dc = gdi32.CreateCompatibleDC(wintypes.HDC(window_dc))
+        bitmap = gdi32.CreateCompatibleBitmap(wintypes.HDC(window_dc), w, h)
+        gdi32.SelectObject(wintypes.HDC(mem_dc), wintypes.HGDIOBJ(bitmap))
+        PW_RENDERFULLCONTENT = 2
+        if not user32.PrintWindow(hwnd, wintypes.HDC(mem_dc), PW_RENDERFULLCONTENT):
+            raise RuntimeError("PrintWindow failed to capture the Shapr3D window.")
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [
+                ("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                ("biClrImportant", wintypes.DWORD),
+            ]
+
+        # Negative height = top-down rows; 32-bit BGRX, no palette.
+        header = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), w, -h, 1, 32, 0)
+        buf = ctypes.create_string_buffer(w * h * 4)
+        if not gdi32.GetDIBits(wintypes.HDC(mem_dc), wintypes.HBITMAP(bitmap),
+                               0, h, buf, ctypes.byref(header), 0):
+            raise RuntimeError("GetDIBits failed to read the captured window.")
+        img = PILImage.frombuffer("RGB", (w, h), buf, "raw", "BGRX", 0, 1)
+        img.crop((
+            frame.left - win.left, frame.top - win.top,
+            frame.right - win.left, frame.bottom - win.top,
+        )).save(out)
+    finally:
+        if bitmap:
+            gdi32.DeleteObject(wintypes.HGDIOBJ(bitmap))
+        if mem_dc:
+            gdi32.DeleteDC(wintypes.HDC(mem_dc))
+        if window_dc:
+            user32.ReleaseDC(hwnd, wintypes.HDC(window_dc))
+        user32.SetThreadDpiAwarenessContext(old_ctx)
+
+
+def _win_set_clipboard(text: str) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+
+    CF_UNICODETEXT, GMEM_MOVEABLE = 13, 0x0002
+    data = ctypes.create_unicode_buffer(text)
+    size = ctypes.sizeof(data)
+    if not user32.OpenClipboard(None):
+        raise RuntimeError("Could not open the clipboard.")
+    try:
+        user32.EmptyClipboard()
+        handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
+        ctypes.memmove(kernel32.GlobalLock(handle), data, size)
+        kernel32.GlobalUnlock(handle)
+        # On success the clipboard owns the memory; don't free it.
+        if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+            raise RuntimeError("Could not set clipboard data.")
+    finally:
+        user32.CloseClipboard()
+
+
+def _app_running() -> bool:
+    if IS_WINDOWS:
+        return bool(_win_app_pids())
+    return subprocess.run(
+        ["pgrep", "-x", APP_NAME], capture_output=True, stdin=subprocess.DEVNULL
+    ).returncode == 0
+
+
+def _activate_app() -> None:
+    if IS_WINDOWS:
+        family = _win_package_family() or WIN_PACKAGE_FAMILY_DEFAULT
+        # Launches the Store app, or brings it forward if already running.
+        os.startfile(f"shell:AppsFolder\\{family}!App")
+    else:
+        subprocess.run(
+            ["open", "-a", APP_NAME], check=True, timeout=15,
+            stdin=subprocess.DEVNULL,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -541,41 +755,76 @@ def list_models() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Shapr3D app bridge (macOS)
+# Shapr3D app bridge (macOS / Windows)
 # ---------------------------------------------------------------------------
+
+IMPORT_DIALOG_NOTE = (
+    "The app shows an Import Preferences dialog (Quality/Speed/Custom); the "
+    "user clicks Import. STEP files carry their units (mm), so no unit "
+    "choice is needed."
+)
+
 
 @mcp.tool()
 def open_in_shapr3d(path: str) -> str:
     """Open a CAD file in Shapr3D. STEP files import as editable solid
-    bodies; Shapr3D shows an import dialog where the user confirms units."""
+    bodies; Shapr3D shows an import dialog where the user confirms units.
+
+    On Windows, Shapr3D (a Store app) only accepts .shapr files from other
+    programs. For STEP and other formats this launches Shapr3D and puts the
+    file's full path on the clipboard; the user then imports it in the app.
+    """
     src = _resolve(path)
     if not src.exists():
         raise FileNotFoundError(f"No such file: {src}")
-    subprocess.run(["open", "-a", APP_NAME, str(src)], check=True, timeout=15)
+    if not IS_WINDOWS:
+        subprocess.run(
+            ["open", "-a", APP_NAME, str(src)], check=True, timeout=15,
+            stdin=subprocess.DEVNULL,
+        )
+        return f"Sent {src.name} to Shapr3D. {IMPORT_DIALOG_NOTE}"
+    if src.suffix.lower() == ".shapr":
+        os.startfile(str(src))  # .shapr is the one type Shapr3D registers
+        return f"Opened {src.name} in Shapr3D."
+    _activate_app()
+    _win_set_clipboard(str(src))
     return (
-        f"Sent {src.name} to Shapr3D. The app shows an Import Preferences "
-        "dialog (Quality/Speed/Custom); the user clicks Import. STEP files "
-        "carry their units (mm), so no unit choice is needed."
+        f"Shapr3D is launched/activated, but on Windows it cannot be handed "
+        f"{src.suffix} files directly. The full path of {src.name} is on the "
+        "clipboard: tell the user to choose Import in Shapr3D, paste the path "
+        "(Ctrl+V) into the file picker's file name box and press Enter, or "
+        f"drag the file onto the Shapr3D window. Path: {src}. "
+        f"{IMPORT_DIALOG_NOTE}"
     )
 
 
 @mcp.tool()
 def shapr3d_status() -> dict:
     """Check whether Shapr3D is installed, running, and frontmost."""
-    installed = Path(f"/Applications/{APP_NAME}.app").exists()
-    running = subprocess.run(
-        ["pgrep", "-x", APP_NAME], capture_output=True
-    ).returncode == 0
     frontmost = None
-    if running:
-        try:
-            front = _osascript(
-                'tell application "System Events" to get name of first '
-                "application process whose frontmost is true"
+    if IS_WINDOWS:
+        import ctypes
+
+        installed = _win_package_family() is not None
+        running = _app_running()
+        if running:
+            hwnd = _win_find_window()
+            frontmost = (
+                hwnd is not None
+                and ctypes.windll.user32.GetForegroundWindow() == hwnd
             )
-            frontmost = front == APP_NAME
-        except Exception:
-            pass
+    else:
+        installed = Path(f"/Applications/{APP_NAME}.app").exists()
+        running = _app_running()
+        if running:
+            try:
+                front = _osascript(
+                    'tell application "System Events" to get name of first '
+                    "application process whose frontmost is true"
+                )
+                frontmost = front == APP_NAME
+            except Exception:
+                pass
     return {
         "installed": installed,
         "running": running,
@@ -592,17 +841,31 @@ def shapr3d_status() -> dict:
 @mcp.tool()
 def activate_shapr3d() -> str:
     """Launch Shapr3D (if needed) and bring it to the foreground."""
-    subprocess.run(["open", "-a", APP_NAME], check=True, timeout=15)
+    _activate_app()
     return "Shapr3D activated."
 
 
 @mcp.tool()
 def screenshot_shapr3d() -> Image:
     """Capture a screenshot of the Shapr3D window to see the current state
-    of the model/app. Requires Screen Recording permission for the host
-    process the first time."""
-    if subprocess.run(["pgrep", "-x", APP_NAME], capture_output=True).returncode != 0:
+    of the model/app. On macOS, requires Screen Recording permission for the
+    host process the first time and captures the window's screen region,
+    so keep it uncovered. On Windows, captures the window even when other
+    windows cover it, but not when it is minimized."""
+    if not _app_running():
         raise RuntimeError("Shapr3D is not running. Call activate_shapr3d first.")
+    out = WORKDIR / "_shapr3d_screenshot.png"
+    if IS_WINDOWS:
+        import ctypes
+
+        hwnd = _win_find_window()
+        if hwnd is None or ctypes.windll.user32.IsIconic(hwnd):
+            raise RuntimeError(
+                "Shapr3D has no visible window (minimized?). Call "
+                "activate_shapr3d first."
+            )
+        _win_capture_window(hwnd, out)
+        return Image(path=str(out))
     try:
         bounds = _osascript(
             f'tell application "System Events" to tell process "{APP_NAME}" to '
@@ -612,9 +875,9 @@ def screenshot_shapr3d() -> Image:
         region = ["-R", f"{x},{y},{w},{h}"]
     except Exception:
         region = []  # fall back to full screen
-    out = WORKDIR / "_shapr3d_screenshot.png"
     subprocess.run(
-        ["screencapture", "-x", *region, str(out)], check=True, timeout=15
+        ["screencapture", "-x", *region, str(out)], check=True, timeout=15,
+        stdin=subprocess.DEVNULL,
     )
     return Image(path=str(out))
 
@@ -690,7 +953,33 @@ plain geometry. Text on faces: BuildSketch on a face + Text + extrude.
 """
 
 
+def _preload_native_modules() -> None:
+    """Import every native-extension module the tools use, before serving.
+
+    The stdio transport reads stdin on a worker thread with a blocking read.
+    On Windows, loading some DLLs (numpy's, among others) while that read is
+    pending deadlocks the process, so the lazy imports inside the tools
+    would hang the first tool call forever. Loading them up front avoids it.
+    """
+    import ctypes  # noqa: F401
+
+    import build123d  # noqa: F401
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot  # noqa: F401
+    import numpy  # noqa: F401
+    import yaml  # noqa: F401
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection  # noqa: F401
+    from OCP.IFSelect import IFSelect_RetDone  # noqa: F401
+    from OCP.IGESControl import IGESControl_Reader  # noqa: F401
+    from OCP.Message import Message  # noqa: F401
+    from PIL import Image  # noqa: F401
+
+
 def main() -> None:
+    if IS_WINDOWS:
+        _preload_native_modules()
     mcp.run()
 
 

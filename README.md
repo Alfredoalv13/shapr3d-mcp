@@ -16,8 +16,8 @@ So this server takes the only robust route:
 2. **STEP file exchange.** Generated models export as STEP, which Shapr3D
    imports as fully **editable solid bodies**. Files you export *from*
    Shapr3D (STEP/IGES/STL) can be inspected, modified, and converted.
-3. **macOS app bridge.** Tools to launch Shapr3D, open files in it, check its
-   state, and screenshot its window for visual feedback.
+3. **App bridge (macOS and Windows).** Tools to launch Shapr3D, open files
+   in it, check its state, and screenshot its window for visual feedback.
 
 ```
 AI assistant ──MCP──▶ this server ──build123d/OCCT──▶ model.step ──▶ Shapr3D
@@ -43,7 +43,8 @@ AI assistant ──MCP──▶ this server ──build123d/OCCT──▶ model.
 
 ## Setup
 
-Requires macOS, [uv](https://docs.astral.sh/uv/), and Shapr3D installed.
+Requires macOS or Windows, [uv](https://docs.astral.sh/uv/), and Shapr3D
+installed (on Windows, the Microsoft Store version).
 
 ```sh
 uv sync
@@ -60,7 +61,8 @@ claude mcp add shapr3d -s user -- uv run --directory "<path-to-this-folder>" sha
 
 ### Claude Desktop
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
+(macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 ```json
 {
@@ -87,6 +89,21 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 Generated files live in `models/` (override with `SHAPR3D_MCP_WORKDIR`).
 
+### Windows notes
+
+Shapr3D for Windows is a Store app, which only accepts `.shapr` files from
+other programs. For STEP and the other formats, `open_in_shapr3d`
+launches or activates Shapr3D and copies the file's full path to the
+clipboard. Choose **Import** in Shapr3D and paste the path into the file
+picker, or drag the file onto the Shapr3D window.
+
+`screenshot_shapr3d` captures the Shapr3D window even when other windows
+cover it, but not while it is minimized.
+
+The server loads its CAD and plotting libraries at startup (a few seconds)
+rather than on first use. On Windows, loading those native libraries
+while the MCP stdio transport is reading stdin deadlocks the process.
+
 ## Development
 
 ```sh
@@ -105,6 +122,8 @@ Shapr3D app needed) in a throwaway workspace.
   on imported solids regardless.
 - In-app actions (sketching, export) happen via the user or OS-level
   computer-use automation; there is no app API to drive.
+- On Windows, non-`.shapr` files can't be pushed into Shapr3D
+  programmatically; the user finishes the import (see Windows notes).
 
 ## License
 

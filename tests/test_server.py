@@ -5,6 +5,7 @@ app). The workspace is a temp directory set up in conftest.py.
 """
 
 import os
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -28,7 +29,8 @@ def test_safe_name_sanitizes():
 
 def test_resolve_relative_against_workdir():
     assert server._resolve("foo.step") == WORKDIR / "foo.step"
-    assert server._resolve("/tmp/abs.step") == Path("/tmp/abs.step")
+    absolute = Path(tempfile.gettempdir()) / "abs.step"
+    assert server._resolve(str(absolute)) == absolute
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +219,11 @@ def test_render_preview_writes_png():
 def test_list_models_skips_broken_symlinks_and_dirs():
     real = WORKDIR / "listed.step"
     server.create_model("listed", BOX_SCRIPT)
-    (WORKDIR / "ghost.step").symlink_to(WORKDIR / "does_not_exist.step")
+    try:
+        (WORKDIR / "ghost.step").symlink_to(WORKDIR / "does_not_exist.step")
+    except OSError:
+        # Windows needs admin rights or Developer Mode to create symlinks.
+        pytest.skip("symlinks not permitted on this system")
     (WORKDIR / "folder.step").mkdir(exist_ok=True)
     try:
         paths = [m["path"] for m in server.list_models()]
@@ -227,3 +233,14 @@ def test_list_models_skips_broken_symlinks_and_dirs():
     finally:
         (WORKDIR / "ghost.step").unlink()
         (WORKDIR / "folder.step").rmdir()
+
+
+# ---------------------------------------------------------------------------
+# app bridge (runs without Shapr3D installed)
+# ---------------------------------------------------------------------------
+
+def test_shapr3d_status_reports_without_failing():
+    status = server.shapr3d_status()
+    assert isinstance(status["installed"], bool)
+    assert isinstance(status["running"], bool)
+    assert status["workspace"] == str(WORKDIR)
