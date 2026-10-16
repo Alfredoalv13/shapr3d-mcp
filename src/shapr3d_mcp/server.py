@@ -90,13 +90,19 @@ def _import_iges(path: Path):
 
 
 def _import_any(path: Path):
-    from build123d import Compound, Mesher, import_brep, import_step, import_stl
+    from build123d import Compound, Mesher, import_brep, import_step
 
     suffix = path.suffix.lower()
     if suffix in {".step", ".stp"}:
         return import_step(str(path))
     if suffix == ".stl":
-        return import_stl(str(path))
+        # import_stl returns one triangulation-only Face with no surface:
+        # no solids, zero volume, and STEP/BREP export of it is empty.
+        # Mesher sews the triangles into a proper Solid instead.
+        shapes = Mesher().read(str(path))
+        if not shapes:
+            raise ValueError(f"No shapes found in STL file: {path}")
+        return shapes[0] if len(shapes) == 1 else Compound(children=shapes)
     if suffix == ".brep":
         return import_brep(str(path))
     if suffix in {".iges", ".igs"}:
@@ -177,12 +183,59 @@ def _run_script(script: str, extra_globals: dict | None = None):
     return result
 
 
+def _has_mesh_only_faces(shape) -> bool:
+    from OCP.BRep import BRep_Tool
+
+    return any(BRep_Tool.Surface_s(f.wrapped) is None for f in shape.faces())
+
+
+def _output_base(src: Path, output_name: str | None, default: str,
+                 formats: list[str], keep_existing: bool = False) -> Path:
+    """Pick the output base path, never one that would overwrite `src`.
+
+    With keep_existing, a defaulted name also steers clear of any file that
+    already exists (e.g. converting x.stl must not clobber a sibling x.step).
+    """
+    def targets(b: Path) -> list[Path]:
+        return [b.parent / (b.name + "." + f.lower().lstrip(".")) for f in formats]
+
+    if output_name:
+        base = WORKDIR / _safe_name(output_name)
+        if src.resolve() in {t.resolve() for t in targets(base)}:
+            raise ValueError(
+                f"output_name '{output_name}' would overwrite the input file "
+                f"{src.name}; choose a different name."
+            )
+        return base
+
+    def taken(b: Path) -> bool:
+        return any(
+            t.resolve() == src.resolve() or (keep_existing and t.exists())
+            for t in targets(b)
+        )
+
+    base = WORKDIR / _safe_name(default)
+    if taken(base):
+        base = WORKDIR / _safe_name(default + "_converted")
+        n = 2
+        while taken(base):
+            base = WORKDIR / _safe_name(f"{default}_converted{n}")
+            n += 1
+    return base
+
+
 def _export(shape, base: Path, formats: list[str]) -> list[str]:
     from build123d import Mesher, export_brep, export_gltf, export_step, export_stl
 
     written: list[str] = []
     for fmt in formats:
         fmt = fmt.lower().lstrip(".")
+        if fmt in {"step", "brep"} and _has_mesh_only_faces(shape):
+            raise RuntimeError(
+                f"Cannot export {fmt}: the shape contains mesh-only faces "
+                "(triangulation without surface geometry), which would write "
+                "a file with no geometry."
+            )
         # Not with_suffix(): names like "bracket v1.2" must keep their dots.
         out = base.parent / (base.name + "." + fmt)
         # build123d exporters return False instead of raising on failure.
@@ -273,12 +326,11 @@ def create_model(name: str, script: str, formats: list[str] | None = None,
     The script runs with `from build123d import *` already in scope and MUST
     assign the final shape to a variable named `result`. Dimensions are in mm.
 
-    Example script:
+    Example script (rounded block with a through-hole):
         with BuildPart() as p:
             Box(80, 40, 20)
             fillet(p.edges().filter_by(Axis.Z), radius=5)
-            with Locations((0, 0, 10)):
-                Cylinder(8, 20, mode=Mode.SUBTRACT)
+            Cylinder(8, 20, mode=Mode.SUBTRACT)
         result = p.part
 
     Args:
@@ -333,7 +385,8 @@ def modify_model(input_path: str, script: str, output_name: str | None = None,
     if params_file:
         extra["params"] = _load_params(params_file)
     shape = _run_script(script, extra)
-    base = WORKDIR / _safe_name(output_name or src.stem + "_modified")
+    base = _output_base(src, output_name, src.stem + "_modified",
+                        formats or ["step"])
     files = _export(shape, base, formats or ["step"])
     return {"files": files, "stats": _shape_stats(shape)}
 
@@ -452,12 +505,15 @@ def convert_model(path: str, formats: list[str], output_name: str | None = None)
     """Convert a CAD file to other formats. Reads STEP/IGES/STL/BREP/3MF and
     writes step, stl, 3mf, gltf, glb, brep (glTF is export-only). E.g.
     convert an STL mesh to STEP-wrapped geometry, or STEP to STL for 3D
-    printing."""
+    printing. Without output_name, outputs are named after the input but
+    never overwrite an existing file (a "_converted" suffix is added)."""
     src = _resolve(path)
     if not src.exists():
         raise FileNotFoundError(f"No such file: {src}")
     shape = _import_any(src)
-    base = WORKDIR / _safe_name(output_name or src.stem)
+    # Defaults to the source stem, but never over the source file itself.
+    # Shape is imported first so a bad file fails before anything is written.
+    base = _output_base(src, output_name, src.stem, formats, keep_existing=True)
     return {"files": _export(shape, base, formats)}
 
 
@@ -491,7 +547,11 @@ def render_preview(path: str, width: int = 800, height: int = 600) -> Image:
     light = light / np.linalg.norm(light)
     shade = 0.35 + 0.65 * np.clip(normals @ light, 0, 1)
     colors = np.outer(shade, np.array([0.35, 0.55, 0.85]))
-    coll = Poly3DCollection(tris, facecolors=colors, edgecolor="none")
+    # Stroke each triangle in its own colour: with edgecolor="none" the
+    # antialiased gaps between triangles show up as light seams.
+    coll = Poly3DCollection(
+        tris, facecolors=colors, edgecolors=colors, linewidths=0.4
+    )
     ax.add_collection3d(coll)
     lo, hi = tris.reshape(-1, 3).min(axis=0), tris.reshape(-1, 3).max(axis=0)
     center, span = (lo + hi) / 2, (hi - lo).max() / 2 or 1
