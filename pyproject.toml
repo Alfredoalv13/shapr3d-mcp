@@ -12,6 +12,7 @@ keywords = ["mcp", "cad", "shapr3d", "build123d", "step", "opencascade"]
 classifiers = [
     "Programming Language :: Python :: 3.13",
     "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Topic :: Multimedia :: Graphics :: 3D Modeling",
 ]
 requires-python = ">=3.13"
